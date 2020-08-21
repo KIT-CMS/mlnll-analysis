@@ -100,18 +100,14 @@ def model(x, num_variables, num_classes, fold, reuse=False):
     with tf.variable_scope('model_fold{}'.format(fold), reuse=reuse):
         w1 = tf.get_variable('w1', shape=(num_variables, hidden_nodes), initializer=tf.random_normal_initializer(), dtype=tf.float64)
         b1 = tf.get_variable('b1', shape=(hidden_nodes), initializer=tf.constant_initializer(), dtype=tf.float64)
-        w2 = tf.get_variable('w2', shape=(hidden_nodes, hidden_nodes), initializer=tf.random_normal_initializer(), dtype=tf.float64)
-        b2 = tf.get_variable('b2', shape=(hidden_nodes), initializer=tf.constant_initializer(), dtype=tf.float64)
-        w3 = tf.get_variable('w3', shape=(hidden_nodes, num_classes), initializer=tf.random_normal_initializer(), dtype=tf.float64)
-        b3 = tf.get_variable('b3', shape=(num_classes), initializer=tf.constant_initializer(), dtype=tf.float64)
-
+        w2 = tf.get_variable('w2', shape=(hidden_nodes, num_classes), initializer=tf.random_normal_initializer(), dtype=tf.float64)
+        b2 = tf.get_variable('b2', shape=(num_classes), initializer=tf.constant_initializer(), dtype=tf.float64)
     l1 = tf.tanh(tf.add(b1, tf.matmul(x, w1)))
-    l2 = tf.tanh(tf.add(b2, tf.matmul(l1, w2)))
-    logits = tf.add(b3, tf.matmul(l2, w3))
+    logits = tf.add(b2, tf.matmul(l1, w2))
     f = tf.sigmoid(logits)
     f = tf.squeeze(f)
 
-    return logits, f, [w1, b1, w2, b2, w3, b3]
+    return logits, f, [w1, b1, w2, b2]
 
 
 def main(args):
@@ -125,11 +121,11 @@ def main(args):
     # Scale to expectation in the full dataset
     scale_train = 4.0 / 3.0 * 2.0 # train/test split + two fold
     scale_val = 4.0 * 2.0
-    w_train = w_train * scale_train
-    w_val = w_val * scale_val
+    w_train = w_train
+    w_val = w_val
     for i, name in enumerate(classes):
-        s_train = np.sum(w_train[y_train == i])
-        s_val = np.sum(w_val[y_val == i])
+        s_train = np.sum(w_train[y_train == i]) * scale_train
+        s_val = np.sum(w_val[y_val == i]) * scale_val
         logger.debug('Class / train / val: {} / {} / {}'.format(name, s_train, s_val))
 
     # Build dataset for systematic shifts
@@ -161,11 +157,12 @@ def main(args):
     # Build NLL loss
     y_ph = tf.placeholder(tf.float64, shape=(None,))
     w_ph = tf.placeholder(tf.float64, shape=(None,))
+    s_ph = tf.placeholder(tf.float64, shape=())
 
     nll = 0.0
     bins = np.array(cfg.analysis_binning)
     mu = tf.constant(1.0, tf.float64)
-    nuisances = {}
+    nuisances = []
     epsilon = tf.constant(1e-9, tf.float64)
     for i, (up, down) in enumerate(zip(bins[1:], bins[:-1])):
         logger.debug('Add NLL for bin {} with boundaries [{}, {}]'.format(i, down, up))
@@ -175,15 +172,18 @@ def main(args):
         # Processes
         mask = count_masking(f, up, down)
         procs = {}
+        procs_sumw2 = {}
         for j, name in enumerate(classes):
             proc_w = mask * tf.cast(tf.equal(y_ph, tf.constant(j, tf.float64)), tf.float64) * w_ph
-            procs[name] = tf.reduce_sum(proc_w)
+            procs[name] = tf.reduce_sum(proc_w) * s_ph
+            procs_sumw2[name] = tf.reduce_sum(tf.square(proc_w)) * s_ph
 
         # QCD estimation
         procs['qcd'] = procs['data_ss']
         for p in [n for n in cfg.ml_classes if not n in ['ggh', 'qqh']]:
             procs['qcd'] -= procs[p + '_ss']
         procs['qcd'] = tf.maximum(procs['qcd'], 0)
+        procs_sumw2['qcd'] = procs['qcd']
 
         # Nominal signal and background
         sig = 0
@@ -194,10 +194,12 @@ def main(args):
         for p in ['ztt', 'zl', 'w', 'tt', 'vv', 'qcd']:
             bkg += procs[p]
 
-        # Normalization uncertainties
-        sys = 0.0
-        for n in nuisances:
-            pass
+        # Bin by bin uncertainties
+        sys = tf.constant(0.0, tf.float64)
+        for p in ['ztt', 'zl', 'w', 'tt', 'vv', 'qcd']:
+            n = tf.constant(0.0, tf.float64)
+            nuisances.append(n)
+            sys += n * tf.sqrt(procs_sumw2[p])
 
         # Expectations
         obs = sig + bkg
@@ -210,7 +212,7 @@ def main(args):
     for n in nuisances:
         nll -= tfp.distributions.Normal(
                 loc=tf.constant(0.0, dtype=tf.float64), scale=tf.constant(1.0, dtype=tf.float64)
-                ).log_prob(nuisances[n])
+                ).log_prob(n)
 
     # Compute constraint of mu
     def get_constraint(nll, params):
@@ -220,7 +222,7 @@ def main(args):
         constraint = tf.sqrt(covariance_poi)
         return constraint
 
-    loss_fullnll = get_constraint(nll, [mu] + [nuisances[n] for n in nuisances])
+    loss_fullnll = get_constraint(nll, [mu] + nuisances)
     loss_statsonly = get_constraint(nll, [mu])
 
     # Add minimization ops
@@ -255,12 +257,12 @@ def main(args):
             is_warmup = False
 
         loss_train, _ = session.run([loss, minimize],
-                feed_dict={x_ph: x_train_preproc, y_ph: y_train, w_ph: w_train})
+                feed_dict={x_ph: x_train_preproc, y_ph: y_train, w_ph: w_train, s_ph: scale_train})
 
         if step % validation_steps == 0:
             logger.info('Step / patience: {} / {}'.format(step, patience_count))
             logger.info('Train loss: {:.5f}'.format(loss_train))
-            loss_val = session.run(loss, feed_dict={x_ph: x_val_preproc, y_ph: y_val, w_ph: w_val})
+            loss_val = session.run(loss, feed_dict={x_ph: x_val_preproc, y_ph: y_val, w_ph: w_val, s_ph: scale_val})
             logger.info('Validation loss: {:.5f}'.format(loss_val))
 
             if is_warmup:
