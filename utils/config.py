@@ -306,5 +306,5 @@ ml_classes = ['ggh', 'qqh', 'ztt', 'zl', 'w', 'tt', 'vv']
 # Analysis categories
 
 analysis_categories = {'nll_cat': Selection(name = 'nll_cat')}
-analysis_binning = np.linspace(0, 1, 3)
+analysis_binning = np.linspace(0, 1, 9)
 analysis_variable = 'ml_score'

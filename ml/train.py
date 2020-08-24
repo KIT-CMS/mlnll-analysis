@@ -195,11 +195,12 @@ def main(args):
             bkg += procs[p]
 
         # Bin by bin uncertainties
-        sys = tf.constant(0.0, tf.float64)
+        sumw2_total = tf.constant(0.0, tf.float64)
+        n = tf.constant(0.0, tf.float64)
+        nuisances.append(n)
         for p in ['ztt', 'zl', 'w', 'tt', 'vv', 'qcd']:
-            n = tf.constant(0.0, tf.float64)
-            nuisances.append(n)
-            sys += n * tf.sqrt(procs_sumw2[p])
+            sumw2_total += procs_sumw2[p]
+        sys = n * tf.sqrt(sumw2_total)
 
         # Expectations
         obs = sig + bkg
@@ -239,13 +240,13 @@ def main(args):
     session.run([tf.global_variables_initializer()])
     saver = tf.train.Saver(max_to_keep=1)
 
-    patience = 10
+    patience = 30
     patience_count = patience
     min_loss = 1e9
     tolerance = 0.001
     step = 0
-    validation_steps = 20
-    warmup_steps = 100
+    validation_steps = 100
+    warmup_steps = 500
     while True:
         if step < warmup_steps:
             loss = loss_statsonly
